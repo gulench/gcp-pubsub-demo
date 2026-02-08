@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcp-pubsub-demo
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gcp-pubsub-demo
+  template:
+    metadata:
+      labels:
+        app: gcp-pubsub-demo
+    spec:
+      serviceAccountName: gcp-pubsub-demo-sa
+      tolerations:
+        - key: "app"
+          operator: "Equal"
+          value: "gcp-pubsub-demo"
+          effect: "NoSchedule"
+      containers:
+      - name: app
+        image: us-central1-docker.pkg.dev/project-602c1df5-e612-4947-a79/app-images/gcp-pubsub-demo
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 1
+            memory: 2Gi
+        # env:
+        # - name: SPRING_PROFILES_ACTIVE
+        #   value: "gke"  # Your Cloud Run profile works here
+        livenessProbe:
+          httpGet:
+            path: /actuator/health/liveness
+            port: 8080
+          initialDelaySeconds: 60
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 20
