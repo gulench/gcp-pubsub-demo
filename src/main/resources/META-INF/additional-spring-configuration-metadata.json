@@ -1,0 +1,9 @@
+{
+  "properties": [
+    {
+      "name": "myapp.catalog.subscription-name",
+      "type": "java.lang.String",
+      "description": "Pub/Sub subscription name for 'catalog' messages"
+    }
+  ]
+}
