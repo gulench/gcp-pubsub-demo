@@ -6,6 +6,7 @@ import java.time.Instant;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -13,6 +14,7 @@ import org.springframework.boot.actuate.health.Health;
 import org.springframework.scheduling.TaskScheduler;
 
 import com.google.cloud.spring.pubsub.core.subscriber.PubSubSubscriberTemplate;
+import com.google.cloud.spring.pubsub.support.BasicAcknowledgeablePubsubMessage;
 
 public class SubscriberManager {
     private static final Logger log = LoggerFactory.getLogger(SubscriberManager.class);
@@ -47,7 +49,10 @@ public class SubscriberManager {
             Clock clock,
             BackoffStrategy backoff,
             SubscriberMetricsFactory metricsFactory) {
+        this(name, config, processor, template, scheduler, clock, backoff, metricsFactory, new DefaultComponentsFactory());
+    }
 
+    public SubscriberManager(String name, SubscribersProperties.SubscriptionConfig config, MessageProcessor processor, PubSubSubscriberTemplate template, TaskScheduler scheduler, Clock clock, BackoffStrategy backoff, SubscriberMetricsFactory metricsFactory, ComponentsFactory factory) {
         this.name = name;
         this.config = config;
         this.scheduler = scheduler;
@@ -55,8 +60,8 @@ public class SubscriberManager {
         this.backoff = backoff;
         this.metrics = metricsFactory.create(name);
 
-        this.messageHandler = new MessageReceiverHandler(processor, metrics, clock, this::onSuccessfulMessage);
-        this.managedSubscriber = new ManagedSubscriber(
+        this.messageHandler = factory.createHandler(processor, metrics, clock, this::onSuccessfulMessage);
+        this.managedSubscriber = factory.createSubscriber(
                 config.getSubscriptionId(),
                 template,
                 messageHandler,
@@ -222,5 +227,23 @@ public class SubscriberManager {
 
     public boolean isHealthy() {
         return health().getStatus().equals(org.springframework.boot.actuate.health.Status.UP);
+    }
+
+    // Internal interface to allow mocking components in tests
+    public interface ComponentsFactory {
+        MessageReceiverHandler createHandler(MessageProcessor p, SubscriberMetrics m, Clock c, Runnable onSuccess);
+        ManagedSubscriber createSubscriber(String subId, PubSubSubscriberTemplate t, Consumer<BasicAcknowledgeablePubsubMessage> h, Runnable onFailure);
+    }
+
+    public static class DefaultComponentsFactory implements ComponentsFactory {
+        @Override
+        public MessageReceiverHandler createHandler(MessageProcessor p, SubscriberMetrics m, Clock c, Runnable onSuccess) {
+            return new MessageReceiverHandler(p, m, c, onSuccess);
+        }
+
+        @Override
+        public ManagedSubscriber createSubscriber(String subId, PubSubSubscriberTemplate t, Consumer<BasicAcknowledgeablePubsubMessage> h, Runnable onFailure) {
+            return new ManagedSubscriber(subId, t, h, onFailure);
+        }
     }
 }

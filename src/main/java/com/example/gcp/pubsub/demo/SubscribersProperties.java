@@ -12,16 +12,20 @@ public class SubscribersProperties {
     private Duration monitorInterval = Duration.ofSeconds(30);
     private Map<String, SubscriptionConfig> subscriptions = new HashMap<>();
 
-    public Map<String, SubscriptionConfig> getSubscriptions() {
-        return subscriptions;
-    }
-
     public Duration getMonitorInterval() {
         return monitorInterval;
     }
 
     public void setMonitorInterval(Duration monitorInterval) {
         this.monitorInterval = monitorInterval;
+    }
+
+    public Map<String, SubscriptionConfig> getSubscriptions() {
+        return subscriptions;
+    }
+
+    public void setSubscriptions(Map<String, SubscriptionConfig> subscriptions) {
+        this.subscriptions = subscriptions;
     }
 
     public static class SubscriptionConfig {

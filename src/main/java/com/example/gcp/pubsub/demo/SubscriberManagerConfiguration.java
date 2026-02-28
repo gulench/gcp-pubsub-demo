@@ -36,6 +36,10 @@ public class SubscriberManagerConfiguration {
             SubscriptionConfig config = entry.getValue();
             SubscriptionConfig resolvedConfig = resolveSubscriberConfig(config, properties);
 
+            if (!resolvedConfig.isEnabled()) {
+                continue;
+            }
+
             MessageProcessor processor = resolveProcessor(name, processors);
 
             SubscriberManager manager = new SubscriberManager(
@@ -79,6 +83,12 @@ public class SubscriberManagerConfiguration {
     }
 
     private MessageProcessor resolveProcessor(String name, Map<String, MessageProcessor> processors) {
-        return processors.get(name + "-processor");
+        MessageProcessor processor = processors.get(name + "-processor");
+        if (processor == null) {
+            throw new IllegalStateException(
+                    "No MessageProcessor bean found for subscriber '" + name + "'. " +
+                            "Expected a bean named '" + name + "-processor'.");
+        }
+        return processor;
     }
 }
