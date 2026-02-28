@@ -1,6 +1,6 @@
 package com.example.gcp.pubsub.demo;
 
-import java.util.concurrent.Executors;
+import java.time.Clock;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -22,23 +22,55 @@ public abstract class AbstractPubSubSubscriber {
     private static final long RECONNECT_DELAY_SECONDS = 30;
     private static final long HEALTH_CHECK_INTERVAL_SECONDS = 60;
     private static final long MIN_WARN_INTERVAL_SECONDS = 60;
+    private static final long MAX_IDLE_SECONDS = 120;
 
     private final PubSubSubscriberTemplate subscriberTemplate;
     private final String subscriptionName;
+    private final ScheduledExecutorService scheduler;
+    private final Clock clock;
 
     private final AtomicBoolean stopping = new AtomicBoolean(false);
-    private final ScheduledExecutorService scheduler;
 
     private Subscriber subscriber;
+    private long lastMessageReceivedAt;
     private long lastWarnedAt = Long.MIN_VALUE;
 
-    protected AbstractPubSubSubscriber(PubSubSubscriberTemplate subscriberTemplate, String subscriptionName) {
+    // ----------------------------------------------------------------------------------
+    // Constructors
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Production constructor. Uses a dedicated daemon-threaded scheduler and
+     * the system UTC clock; both are created internally so callers don't need
+     * to supply them.
+     */
+    protected AbstractPubSubSubscriber(PubSubSubscriberTemplate subscriberTemplate,
+                                       String subscriptionName) {
+        this(subscriberTemplate, subscriptionName,
+                defaultScheduler(subscriptionName), Clock.systemUTC());
+    }
+
+    /**
+     * Testing constructor. Accepts an externally supplied scheduler and clock so
+     * that tests can use a {@code ManuallyAdvancedClock} or a
+     * {@code DirectExecutorService} to control timing deterministically.
+     */
+    protected AbstractPubSubSubscriber(PubSubSubscriberTemplate subscriberTemplate,
+                                       String subscriptionName,
+                                       ScheduledExecutorService scheduler,
+                                       Clock clock) {
         if (subscriptionName == null || subscriptionName.isBlank()) {
             throw new IllegalArgumentException("subscriptionName must not be null or blank");
         }
         this.subscriberTemplate = subscriberTemplate;
         this.subscriptionName = subscriptionName;
-        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        this.scheduler = scheduler;
+        this.clock = clock;
+        this.lastMessageReceivedAt = clock.millis();
+    }
+
+    private static ScheduledExecutorService defaultScheduler(String subscriptionName) {
+        return java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "pubsub-reconnect-" + subscriptionName);
             t.setDaemon(true);
             return t;
@@ -50,18 +82,18 @@ public abstract class AbstractPubSubSubscriber {
     // ----------------------------------------------------------------------------------
 
     /**
-     * Processes a successfully received message. Implementations should throw an
-     * unchecked exception if processing fails; the base class will call {@code nack()}
-     * automatically in that case so the message is redelivered by Pub/Sub.
+     * Processes a successfully received message. Throw an unchecked exception if
+     * processing fails; the base class calls {@code nack()} automatically so the
+     * message is redelivered by Pub/Sub.
      */
     protected abstract void processMessage(String payload);
 
     // ----------------------------------------------------------------------------------
-    // Lifecycle
+    // Lifecycle — called by Spring but also directly callable from tests
     // ----------------------------------------------------------------------------------
 
     @PostConstruct
-    public final void start() {
+    public void start() {
         connect();
         scheduler.scheduleAtFixedRate(
                 this::healthCheck,
@@ -71,7 +103,7 @@ public abstract class AbstractPubSubSubscriber {
     }
 
     @PreDestroy
-    public final void stop() {
+    public void stop() {
         LOGGER.info("Stopping subscriber for {}", subscriptionName);
         stopping.set(true);
 
@@ -84,6 +116,15 @@ public abstract class AbstractPubSubSubscriber {
 
         scheduler.shutdown();
         LOGGER.info("Stopped subscriber for {}", subscriptionName);
+    }
+
+    /**
+     * Exposes the health check for direct invocation from tests, bypassing the
+     * scheduler so there is no need for {@code Thread.sleep()} or time manipulation
+     * to trigger a check.
+     */
+    public void runHealthCheck() {
+        healthCheck();
     }
 
     // ----------------------------------------------------------------------------------
@@ -99,7 +140,8 @@ public abstract class AbstractPubSubSubscriber {
             try {
                 subscriber.stopAsync();
             } catch (Exception e) {
-                LOGGER.warn("Error stopping previous subscriber for {} before reconnect", subscriptionName, e);
+                LOGGER.warn("Error stopping previous subscriber for {} before reconnect",
+                        subscriptionName, e);
             }
             subscriber = null;
         }
@@ -120,8 +162,7 @@ public abstract class AbstractPubSubSubscriber {
             LOGGER.info("Started subscriber for {}", subscriptionName);
 
         } catch (Exception e) {
-            LOGGER.error(
-                    "Failed to create subscriber for {}, scheduling reconnect in {}s",
+            LOGGER.error("Failed to create subscriber for {}, scheduling reconnect in {}s",
                     subscriptionName, RECONNECT_DELAY_SECONDS, e);
             subscriber = null;
             scheduleReconnect();
@@ -140,13 +181,28 @@ public abstract class AbstractPubSubSubscriber {
         if (isUnhealthy) {
             maybeWarn();
             connect();
-        } else {
-            LOGGER.debug("Health check passed for {}, state: {}", subscriptionName, subscriber.state());
+            return;
         }
+
+        long idleSeconds = TimeUnit.MILLISECONDS.toSeconds(
+                clock.millis() - lastMessageReceivedAt);
+
+        if (idleSeconds > MAX_IDLE_SECONDS) {
+            LOGGER.warn(
+                    "Subscriber for {} has been idle for {}s with no messages received, "
+                    + "stream may be silently broken — reconnecting",
+                    subscriptionName, idleSeconds);
+            lastMessageReceivedAt = clock.millis();
+            connect();
+            return;
+        }
+
+        LOGGER.debug("Health check passed for {}, state: {}, idle for {}s",
+                subscriptionName, subscriber.state(), idleSeconds);
     }
 
     private void maybeWarn() {
-        long now = System.currentTimeMillis();
+        long now = clock.millis();
         long elapsedMs = now - lastWarnedAt;
 
         if (elapsedMs >= TimeUnit.SECONDS.toMillis(MIN_WARN_INTERVAL_SECONDS)) {
@@ -174,11 +230,14 @@ public abstract class AbstractPubSubSubscriber {
             scheduler.schedule(this::connect, RECONNECT_DELAY_SECONDS, TimeUnit.SECONDS);
             LOGGER.info("Reconnect for {} scheduled in {}s", subscriptionName, RECONNECT_DELAY_SECONDS);
         } catch (Exception e) {
-            LOGGER.warn("Could not schedule reconnect for {} (scheduler may be shut down)", subscriptionName, e);
+            LOGGER.warn("Could not schedule reconnect for {} (scheduler may be shut down)",
+                    subscriptionName, e);
         }
     }
 
     private void handleMessage(BasicAcknowledgeablePubsubMessage message) {
+        lastMessageReceivedAt = clock.millis();
+
         String payload = message.getPubsubMessage().getData().toStringUtf8();
         LOGGER.info("Handling message for {}, payload: {}", subscriptionName, payload);
 
