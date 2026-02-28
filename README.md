@@ -335,3 +335,62 @@ kubectl get nodes
 kubectl apply k8s/
 ```
 
+## Design
+
+### Subscriber (Main)
+
+```txt
+PubSubProperties
+        ↓
+SubscriberManagerAutoConfiguration
+        ↓
+SubscriberManagerRegistry
+        ↓
+SubscriberManager (per subscription)
+        ↓
+PubSubSubscriberTemplate
+```
+
+```txt
+application.yml
+    ↓
+logical name
+    ↓
+SubscriberManagerConfiguration
+    ↓
+ProjectSubscriptionName.of(projectId, subscriptionName)
+    ↓
+SubscriberManager
+    ↓
+PubSubSubscriberTemplate.subscribe(...)
+```
+
+### Subscriber (Health)
+
+```txt
+SubscriberManager
+    -> exposes Health health()
+
+SubscriberManagerRegistry
+    -> holds all managers
+
+PubSubSubscribersHealthContributor
+    -> dynamically exposes each manager as HealthIndicator
+
+-------------
+
+PubSubSubscribersHealthContributor
+        ↓
+SubscriberManager.health()
+```
+
+### Subscriber (Metrics)
+
+```txt
+
+SubscriberMetrics (interface)
+        ↓
+MicrometerSubscriberMetrics
+```
+
+## Implementation
