@@ -6,42 +6,32 @@ import java.time.Instant;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.actuate.health.Health;
 import org.springframework.scheduling.TaskScheduler;
 
-import com.google.cloud.pubsub.v1.Subscriber;
 import com.google.cloud.spring.pubsub.core.subscriber.PubSubSubscriberTemplate;
-import com.google.cloud.spring.pubsub.support.BasicAcknowledgeablePubsubMessage;
-import com.google.common.util.concurrent.MoreExecutors;
 
 public class SubscriberManager {
     private static final Logger log = LoggerFactory.getLogger(SubscriberManager.class);
 
-    private final PubSubSubscriberTemplate template;
     private final String name;
-    private final MessageProcessor processor;
     private final SubscribersProperties.SubscriptionConfig config;
 
     private final TaskScheduler scheduler;
     private final Clock clock;
     private final BackoffStrategy backoff;
 
-    private final AtomicReference<Subscriber> subscriberRef = new AtomicReference<>();
-    private final AtomicBoolean running = new AtomicBoolean(false);
-    private final AtomicBoolean paused = new AtomicBoolean(false);
+    // Components
+    private final ManagedSubscriber managedSubscriber;
+    private final MessageReceiverHandler messageHandler;
+
+    // State
+    private final AtomicBoolean active = new AtomicBoolean(false); // User intention (start/stop)
+    private final AtomicBoolean paused = new AtomicBoolean(false); // User intention (pause/resume)
     private final AtomicInteger restartAttempts = new AtomicInteger(0);
-
-    private final AtomicReference<Instant> lastMessageTime = new AtomicReference<>();
-    private final AtomicBoolean firstMessageReceived = new AtomicBoolean(false);
-
-    private final ReentrantLock pauseLock = new ReentrantLock();
-    private final Condition unpaused = pauseLock.newCondition();
 
     private ScheduledFuture<?> monitorTask;
 
@@ -59,85 +49,57 @@ public class SubscriberManager {
             SubscriberMetricsFactory metricsFactory) {
 
         this.name = name;
-        this.template = template;
-        this.processor = processor;
         this.config = config;
         this.scheduler = scheduler;
         this.clock = clock;
         this.backoff = backoff;
         this.metrics = metricsFactory.create(name);
+
+        this.messageHandler = new MessageReceiverHandler(processor, metrics, clock, this::onSuccessfulMessage);
+        this.managedSubscriber = new ManagedSubscriber(
+                config.getSubscriptionId(),
+                template,
+                messageHandler,
+                this::onSubscriberFailure);
     }
 
     // ---------------- Lifecycle ----------------
 
     public synchronized void start() {
-        if (running.get())
+        if (active.get())
             return;
 
-        running.set(true);
-        firstMessageReceived.set(false);
-        createAndStartSubscriber();
+        active.set(true);
+        restartAttempts.set(0);
+        managedSubscriber.start();
         scheduleMonitor();
     }
 
     public synchronized void stop() {
-        running.set(false);
+        active.set(false);
         cancelMonitor();
-        Subscriber sub = subscriberRef.getAndSet(null);
-        if (sub != null)
-            sub.stopAsync();
+        managedSubscriber.stop();
     }
 
-    public void pause() {
+    public synchronized void pause() {
         paused.set(true);
-    }
-
-    public void resume() {
-        pauseLock.lock();
-        try {
-            paused.set(false);
-            unpaused.signalAll();
-        } finally {
-            pauseLock.unlock();
+        if (active.get()) {
+            managedSubscriber.stop();
         }
     }
 
-    // ---------------- Core ----------------
-
-    private void createAndStartSubscriber() {
-
-        Subscriber subscriber = template.subscribe(config.getSubscriptionId(), this::processMessage);
-        subscriber
-                .addListener(new Subscriber.Listener() {
-                    @Override
-                    public void failed(Subscriber.State from, Throwable failure) {
-                        scheduleRestart();
-                    }
-                }, MoreExecutors.directExecutor());
-
-        subscriberRef.set(subscriber);
-        lastMessageTime.set(Instant.now(clock));
+    public synchronized void resume() {
+        paused.set(false);
+        if (active.get()) {
+            managedSubscriber.start();
+        }
     }
 
-    private void processMessage(BasicAcknowledgeablePubsubMessage ackableMessage) {
-
-        blockIfPaused();
-
-        lastMessageTime.set(Instant.now(clock));
-        metrics.incrementMessage();
-
-        try {
-            processor.process(ackableMessage.getPubsubMessage());
-            ackableMessage.ack();
-        } catch (Exception e) {
-            ackableMessage.nack();
-        }
-
-        if (firstMessageReceived.compareAndSet(false, true)) {
+    private void onSuccessfulMessage() {
+        if (restartAttempts.get() > 0) {
             restartAttempts.set(0);
             backoff.reset();
         }
-
     }
 
     // ---------------- Monitor ----------------
@@ -156,27 +118,27 @@ public class SubscriberManager {
 
     private void monitor() {
 
-        if (!running.get())
+        if (!active.get())
             return;
         if (paused.get())
             return;
 
-        Subscriber sub = subscriberRef.get();
-        if (sub == null)
-            return;
-
-        if (sub.state() != Subscriber.State.RUNNING) {
-            scheduleRestart();
-            return;
+        // If not running (and not paused), we might be in a failed state or backoff
+        if (!managedSubscriber.isRunning()) {
+            // We rely on the failure listener to schedule restarts,
+            // but we could add a check here if needed.
         }
 
         if (config.getStallDetectionMode() == StallDetectionMode.NO_DETECTION) {
             return;
         }
 
+        // Stall detection
         Duration idle = Duration.between(
-                lastMessageTime.get(),
+                messageHandler.getLastMessageTime(),
                 Instant.now(clock));
+
+        metrics.recordIdle(idle);
 
         if (idle.compareTo(config.getStallThreshold()) > 0) {
 
@@ -190,9 +152,13 @@ public class SubscriberManager {
         }
     }
 
+    private void onSubscriberFailure() {
+        scheduleRestart();
+    }
+
     private void scheduleRestart() {
 
-        if (!running.get())
+        if (!active.get() || paused.get())
             return;
 
         int attempt = restartAttempts.incrementAndGet();
@@ -204,21 +170,10 @@ public class SubscriberManager {
     }
 
     private synchronized void restartNow() {
-        if (!running.get())
+        if (!active.get() || paused.get())
             return;
-        stop();
-        start();
-    }
-
-    private void blockIfPaused() {
-        pauseLock.lock();
-        try {
-            while (paused.get()) {
-                unpaused.awaitUninterruptibly();
-            }
-        } finally {
-            pauseLock.unlock();
-        }
+        managedSubscriber.stop();
+        managedSubscriber.start();
     }
 
     // ---------------- Health ----------------
@@ -232,12 +187,15 @@ public class SubscriberManager {
                     .build();
         }
 
-        Subscriber sub = subscriberRef.get();
-        if (!running.get() || sub == null || sub.state() != Subscriber.State.RUNNING) {
+        if (!active.get()) {
             return Health.down()
                     .withDetail("subscriber", name)
                     .withDetail("state", "stopped")
                     .build();
+        }
+
+        if (!managedSubscriber.isRunning() && restartAttempts.get() <= config.getMaxRestartAttempts()) {
+            return Health.up().withDetail("state", "recovering").build();
         }
 
         return Health.up()
@@ -252,15 +210,14 @@ public class SubscriberManager {
         if (paused.get()) {
             return "PAUSED";
         }
-        Subscriber sub = subscriberRef.get();
-        if (!running.get() || sub == null) {
+        if (!active.get()) {
             return "STOPPED";
         }
-        return sub.state().name();
+        return managedSubscriber.getState();
     }
 
     public boolean isRunning() {
-        return running.get();
+        return active.get();
     }
 
     public boolean isHealthy() {
