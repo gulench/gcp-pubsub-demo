@@ -1,12 +1,12 @@
 package com.example.gcp.pubsub.demo;
 
-import java.util.Iterator;
 import java.util.Map;
+import java.util.stream.Stream;
 
-import org.springframework.boot.actuate.health.CompositeHealthContributor;
-import org.springframework.boot.actuate.health.HealthContributor;
-import org.springframework.boot.actuate.health.HealthIndicator;
-import org.springframework.boot.actuate.health.NamedContributor;
+import org.jspecify.annotations.Nullable;
+import org.springframework.boot.health.contributor.CompositeHealthContributor;
+import org.springframework.boot.health.contributor.HealthContributor;
+import org.springframework.boot.health.contributor.HealthIndicator;
 import org.springframework.stereotype.Component;
 
 @Component("subscribersHealthContributor")
@@ -21,18 +21,17 @@ public class SubscribersHealthContributor
     }
 
     @Override
-    public HealthContributor getContributor(String name) {
+    public @Nullable HealthContributor getContributor(String name) {
         SubscriberManager manager = managers.get(name);
-        return (HealthIndicator) manager::health;
+        return (manager != null) ? asContributor(manager) : null;
     }
 
     @Override
-    public Iterator<NamedContributor<HealthContributor>> iterator() {
+    public Stream<Entry> stream() {
         return managers.entrySet().stream()
-                .map(e -> NamedContributor.of(
+                .map(e -> new Entry(
                         e.getKey(),
-                        asContributor(e.getValue())))
-                .iterator();
+                        asContributor(e.getValue())));
     }
 
     private HealthContributor asContributor(SubscriberManager manager) {

@@ -5,12 +5,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.boot.actuate.health.Health;
-import org.springframework.boot.actuate.health.HealthContributor;
-import org.springframework.boot.actuate.health.HealthIndicator;
-import org.springframework.boot.actuate.health.NamedContributor;
+import org.springframework.boot.health.contributor.Health;
+import org.springframework.boot.health.contributor.HealthContributor;
+import org.springframework.boot.health.contributor.HealthIndicator;
 
-import java.util.Iterator;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -40,17 +38,24 @@ class SubscribersHealthContributorTest {
         HealthContributor healthContributor = contributor.getContributor("test-sub");
 
         assertThat(healthContributor).isInstanceOf(HealthIndicator.class);
-        Health health = ((HealthIndicator) healthContributor).getHealth(false);
-        assertThat(health.getStatus()).isEqualTo(org.springframework.boot.actuate.health.Status.UP);
+        Health health = ((HealthIndicator) healthContributor).health(false);
+        assertThat(health.getStatus()).isEqualTo(org.springframework.boot.health.contributor.Status.UP);
     }
 
     @Test
-    void iterator_shouldReturnNamedContributors() {
-        Iterator<NamedContributor<HealthContributor>> iterator = contributor.iterator();
+    void stream_shouldReturnStreamOfEntries() {
+        when(manager.health()).thenReturn(Health.up().build());
 
-        assertThat(iterator.hasNext()).isTrue();
-        NamedContributor<HealthContributor> namedContributor = iterator.next();
-        assertThat(namedContributor.getName()).isEqualTo("test-sub");
-        assertThat(namedContributor.getContributor()).isInstanceOf(HealthIndicator.class);
+        var entries = contributor.stream().toList();
+
+        assertThat(entries).hasSize(1);
+
+        var entry = entries.get(0);
+        assertThat(entry.name()).isEqualTo("test-sub");
+        assertThat(entry.contributor()).isInstanceOf(HealthIndicator.class);
+
+        Health health = ((HealthIndicator) entry.contributor()).health(false);
+        assertThat(health.getStatus()).isEqualTo(org.springframework.boot.health.contributor.Status.UP);
     }
+
 }

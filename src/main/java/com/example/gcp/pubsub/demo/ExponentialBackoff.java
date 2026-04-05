@@ -1,6 +1,7 @@
 package com.example.gcp.pubsub.demo;
 
 import java.time.Duration;
+import java.util.concurrent.ThreadLocalRandom;
 
 public class ExponentialBackoff {
 
@@ -28,7 +29,7 @@ public class ExponentialBackoff {
         current = Duration.ofMillis(nextMillis);
 
         // Add jitter (±20%)
-        long jitter = (long) (next.toMillis() * 0.2 * Math.random());
+        long jitter = (long) (next.toMillis() * 0.2 * ThreadLocalRandom.current().nextDouble());
         return next.plusMillis(jitter);
     }
 
