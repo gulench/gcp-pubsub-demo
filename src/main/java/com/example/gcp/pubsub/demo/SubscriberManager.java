@@ -1,20 +1,14 @@
 package com.example.gcp.pubsub.demo;
 
-import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.health.contributor.Health;
-import org.springframework.scheduling.TaskScheduler;
-
-import com.google.cloud.spring.pubsub.core.subscriber.PubSubSubscriberTemplate;
-import com.google.cloud.spring.pubsub.support.BasicAcknowledgeablePubsubMessage;
 
 public class SubscriberManager {
     private static final Logger log = LoggerFactory.getLogger(SubscriberManager.class);
@@ -22,13 +16,13 @@ public class SubscriberManager {
     private final String name;
     private final SubscribersProperties.SubscriptionConfig config;
 
-    private final TaskScheduler scheduler;
-    private final Clock clock;
     private final BackoffStrategy backoff;
+    private final SubscriberComponentFactory factory;
 
     // Components
     private final ManagedSubscriber managedSubscriber;
     private final MessageReceiverHandler messageHandler;
+    private final SubscriberMetrics metrics;
 
     // State
     private final AtomicBoolean active = new AtomicBoolean(false); // User intention (start/stop)
@@ -37,33 +31,21 @@ public class SubscriberManager {
 
     private ScheduledFuture<?> monitorTask;
 
-    // Metrics
-    private final SubscriberMetrics metrics;
-
-    public SubscriberManager(
-            String name,
-            SubscribersProperties.SubscriptionConfig config,
-            MessageProcessor processor,
-            PubSubSubscriberTemplate template,
-            TaskScheduler scheduler,
-            Clock clock,
-            BackoffStrategy backoff,
-            SubscriberMetricsFactory metricsFactory) {
-        this(name, config, processor, template, scheduler, clock, backoff, metricsFactory, new DefaultComponentsFactory());
-    }
-
-    public SubscriberManager(String name, SubscribersProperties.SubscriptionConfig config, MessageProcessor processor, PubSubSubscriberTemplate template, TaskScheduler scheduler, Clock clock, BackoffStrategy backoff, SubscriberMetricsFactory metricsFactory, ComponentsFactory factory) {
+    public SubscriberManager(String name,
+                             SubscribersProperties.SubscriptionConfig config,
+                             MessageProcessor processor,
+                             SubscriberComponentFactory factory) {
         this.name = name;
         this.config = config;
-        this.scheduler = scheduler;
-        this.clock = clock;
-        this.backoff = backoff;
-        this.metrics = metricsFactory.create(name);
+        this.factory = factory;
+        this.backoff = factory.createBackoff(config);
 
-        this.messageHandler = factory.createHandler(processor, metrics, clock, this::onSuccessfulMessage);
+        // The manager and the handler share the same metrics instance
+        this.metrics = factory.createMetrics(name);
+
+        this.messageHandler = factory.createHandler(processor, this.metrics, this::onSuccessfulMessage);
         this.managedSubscriber = factory.createSubscriber(
                 config.getSubscriptionId(),
-                template,
                 messageHandler,
                 this::onSubscriberFailure);
     }
@@ -110,7 +92,7 @@ public class SubscriberManager {
     // ---------------- Monitor ----------------
 
     private void scheduleMonitor() {
-        monitorTask = scheduler.scheduleWithFixedDelay(
+        monitorTask = factory.getScheduler().scheduleWithFixedDelay(
                 this::monitor,
                 config.getMonitorInterval());
     }
@@ -138,20 +120,15 @@ public class SubscriberManager {
             return;
         }
 
-        // Stall detection
-        Duration idle = Duration.between(
-                messageHandler.getLastMessageTime(),
-                Instant.now(clock));
+        messageHandler.recordIdleMetrics();
 
-        metrics.recordIdle(idle);
-
-        if (idle.compareTo(config.getStallThreshold()) > 0) {
-
+        if (messageHandler.isStalled(config.getStallThreshold())) {
             metrics.incrementStall();
 
             if (config.getStallDetectionMode() == StallDetectionMode.DETECT_AND_WARN) {
-                log.warn("Subscriber {} stalled for {}", name, idle);
+                log.warn("Stall detected for subscriber {} (last message received at {}).", name, messageHandler.getLastMessageTime());
             } else {
+                log.warn("Stall detected for subscriber {} (last message received at {}); scheduling restart.", name, messageHandler.getLastMessageTime());
                 scheduleRestart();
             }
         }
@@ -168,10 +145,12 @@ public class SubscriberManager {
 
         int attempt = restartAttempts.incrementAndGet();
         Duration delay = backoff.nextDelay(attempt);
-
         metrics.incrementRestart();
 
-        scheduler.schedule(this::restartNow, Instant.now().plus(delay));
+        factory.getScheduler().schedule(
+                this::restartNow,
+                Instant.now(factory.getClock()).plus(delay)
+        );
     }
 
     private synchronized void restartNow() {
@@ -199,8 +178,15 @@ public class SubscriberManager {
                     .build();
         }
 
-        if (!managedSubscriber.isRunning() && restartAttempts.get() <= config.getMaxRestartAttempts()) {
-            return Health.up().withDetail("state", "recovering").build();
+        if (!managedSubscriber.isRunning()) {
+            if (restartAttempts.get() <= config.getMaxRestartAttempts()) {
+                return Health.up().withDetail("state", "recovering").build();
+            }
+            return Health.down()
+                    .withDetail("subscriber", name)
+                    .withDetail("state", "failed")
+                    .withDetail("restartAttempts", restartAttempts.get())
+                    .build();
         }
 
         return Health.up()
@@ -227,23 +213,5 @@ public class SubscriberManager {
 
     public boolean isHealthy() {
         return health().getStatus().equals(org.springframework.boot.health.contributor.Status.UP);
-    }
-
-    // Internal interface to allow mocking components in tests
-    public interface ComponentsFactory {
-        MessageReceiverHandler createHandler(MessageProcessor p, SubscriberMetrics m, Clock c, Runnable onSuccess);
-        ManagedSubscriber createSubscriber(String subId, PubSubSubscriberTemplate t, Consumer<BasicAcknowledgeablePubsubMessage> h, Runnable onFailure);
-    }
-
-    public static class DefaultComponentsFactory implements ComponentsFactory {
-        @Override
-        public MessageReceiverHandler createHandler(MessageProcessor p, SubscriberMetrics m, Clock c, Runnable onSuccess) {
-            return new MessageReceiverHandler(p, m, c, onSuccess);
-        }
-
-        @Override
-        public ManagedSubscriber createSubscriber(String subId, PubSubSubscriberTemplate t, Consumer<BasicAcknowledgeablePubsubMessage> h, Runnable onFailure) {
-            return new ManagedSubscriber(subId, t, h, onFailure);
-        }
     }
 }

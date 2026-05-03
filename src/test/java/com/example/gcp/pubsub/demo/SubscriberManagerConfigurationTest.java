@@ -14,16 +14,12 @@ import org.springframework.scheduling.TaskScheduler;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 
 import com.example.gcp.pubsub.demo.SubscribersProperties.SubscriptionConfig;
-import com.google.cloud.spring.pubsub.core.subscriber.PubSubSubscriberTemplate;
 
 class SubscriberManagerConfigurationTest {
 
     private SubscriberManagerConfiguration configuration;
     private SubscribersProperties properties;
-    private PubSubSubscriberTemplate template;
-    private TaskScheduler scheduler;
-    private Clock clock;
-    private SubscriberMetricsFactory metricsFactory;
+    private SubscriberComponentFactory factory;
     private MessageProcessor processor1;
     private MessageProcessor processor2;
 
@@ -31,10 +27,7 @@ class SubscriberManagerConfigurationTest {
     void setUp() {
         configuration = new SubscriberManagerConfiguration();
         properties = new SubscribersProperties();
-        template = mock(PubSubSubscriberTemplate.class);
-        scheduler = mock(TaskScheduler.class);
-        clock = Clock.systemUTC();
-        metricsFactory = mock(SubscriberMetricsFactory.class);
+        factory = mock(SubscriberComponentFactory.class);
         processor1 = mock(MessageProcessor.class);
         processor2 = mock(MessageProcessor.class);
     }
@@ -69,7 +62,7 @@ class SubscriberManagerConfigurationTest {
 
         // Act
         SubscriberManagerRegistry registry = configuration.subscriberManagerRegistry(
-                properties, template, scheduler, clock, metricsFactory, processors);
+                properties, factory, processors);
 
         // Assert
         Map<String, SubscriberManager> managers = registry.getManagers();
@@ -93,7 +86,7 @@ class SubscriberManagerConfigurationTest {
 
         // Act & Assert
         assertThatThrownBy(() -> configuration.subscriberManagerRegistry(
-                properties, template, scheduler, clock, metricsFactory, processors))
+                properties, factory, processors))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessage("No MessageProcessor bean found for subscriber 'sub1'. Expected a bean named 'sub1-processor'.");
     }

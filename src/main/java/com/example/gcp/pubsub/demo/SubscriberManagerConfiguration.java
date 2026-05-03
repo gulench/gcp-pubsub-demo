@@ -3,9 +3,7 @@ package com.example.gcp.pubsub.demo;
 import java.time.Clock;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Random;
 
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -13,7 +11,6 @@ import org.springframework.scheduling.TaskScheduler;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 
 import com.example.gcp.pubsub.demo.SubscribersProperties.SubscriptionConfig;
-import com.google.cloud.spring.pubsub.core.subscriber.PubSubSubscriberTemplate;
 
 @Configuration
 @EnableConfigurationProperties(SubscribersProperties.class)
@@ -22,10 +19,7 @@ public class SubscriberManagerConfiguration {
     @Bean
     public SubscriberManagerRegistry subscriberManagerRegistry(
             SubscribersProperties properties,
-            PubSubSubscriberTemplate template,
-            @Qualifier("subscriberSupervisionScheduler") TaskScheduler scheduler,
-            Clock clock,
-            SubscriberMetricsFactory metricsFactory,
+            SubscriberComponentFactory factory,
             Map<String, MessageProcessor> processors) {
 
         Map<String, SubscriberManager> managers = new HashMap<>();
@@ -43,15 +37,7 @@ public class SubscriberManagerConfiguration {
             MessageProcessor processor = resolveProcessor(name, processors);
 
             SubscriberManager manager = new SubscriberManager(
-                    name,
-                    resolvedConfig,
-                    processor,
-                    template,
-                    scheduler,
-                    clock,
-                    new ExponentialBackoffStrategy(resolvedConfig.getMinBackoff(), resolvedConfig.getMaxBackoff(),
-                            new Random()),
-                    metricsFactory);
+                    name, resolvedConfig, processor, factory);
 
             managers.put(name, manager);
         }

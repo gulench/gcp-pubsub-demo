@@ -8,6 +8,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 
@@ -75,6 +76,39 @@ class MessageReceiverHandlerTest {
         verifyNoInteractions(onSuccess); // Success callback not triggered
 
         assertThat(handler.getLastMessageTime()).isEqualTo(now);
+    }
+
+   @Test
+    void recordIdleMetrics_recordsCorrectDuration() {
+        Clock mockClock = mock(Clock.class);
+        // First call in constructor at 'now', second call in recordIdleMetrics at 'now + 30s'
+        when(mockClock.instant()).thenReturn(now, now.plusSeconds(30));
+        when(mockClock.getZone()).thenReturn(ZoneId.of("UTC"));
+
+        MessageReceiverHandler handler = new MessageReceiverHandler(processor, metrics, mockClock, onSuccess);
+
+        handler.recordIdleMetrics();
+
+        verify(metrics).recordIdle(Duration.ofSeconds(30));
+    }
+
+    @Test
+    void isStalled_returnsTrueWhenThresholdExceeded() {
+        Clock mockClock = mock(Clock.class);
+        when(mockClock.instant()).thenReturn(now, now.plusSeconds(10));
+        when(mockClock.getZone()).thenReturn(ZoneId.of("UTC"));
+
+        MessageReceiverHandler handler = new MessageReceiverHandler(processor, metrics, mockClock, onSuccess);
+
+        assertThat(handler.isStalled(Duration.ofSeconds(5))).isTrue();
+    }
+
+    @Test
+    void isStalled_returnsFalseWhenWithinThreshold() {
+        Clock clock = Clock.fixed(now, ZoneId.of("UTC"));
+        MessageReceiverHandler handler = new MessageReceiverHandler(processor, metrics, clock, onSuccess);
+
+        assertThat(handler.isStalled(Duration.ofSeconds(5))).isFalse();
     }
 
     @Test

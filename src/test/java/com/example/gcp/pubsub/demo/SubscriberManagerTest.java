@@ -4,7 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -16,7 +18,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.util.concurrent.ScheduledFuture;
-import java.util.function.Consumer;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -25,25 +26,19 @@ import org.springframework.boot.health.contributor.Status;
 import org.springframework.scheduling.TaskScheduler;
 
 import com.example.gcp.pubsub.demo.SubscribersProperties.SubscriptionConfig;
-import com.google.cloud.spring.pubsub.core.subscriber.PubSubSubscriberTemplate;
-import com.google.cloud.spring.pubsub.support.BasicAcknowledgeablePubsubMessage;
 
 class SubscriberManagerTest {
 
     private SubscriberManager manager;
     private ManagedSubscriber mockSubscriber;
     private MessageReceiverHandler mockHandler;
+    private SubscriberComponentFactory factory;
     private TaskScheduler scheduler;
     private BackoffStrategy backoff;
     private SubscriberMetrics metrics;
-    private SubscriberMetricsFactory metricsFactory;
-    private MessageProcessor processor;
-    private PubSubSubscriberTemplate template;
+
     private SubscriptionConfig config;
-    private Clock clock;
     private Instant now;
-    private Runnable capturedFailureCallback;
-    private Runnable capturedSuccessCallback;
 
     @BeforeEach
     void setUp() {
@@ -52,42 +47,48 @@ class SubscriberManagerTest {
         scheduler = mock(TaskScheduler.class);
         backoff = mock(BackoffStrategy.class);
         metrics = mock(SubscriberMetrics.class);
-        metricsFactory = mock(SubscriberMetricsFactory.class);
-        processor = mock(MessageProcessor.class);
-        template = mock(PubSubSubscriberTemplate.class);
-
-        when(metricsFactory.create(anyString())).thenReturn(metrics);
+        factory = mock(SubscriberComponentFactory.class);
+        MessageProcessor processor = mock(MessageProcessor.class);
 
         config = new SubscriptionConfig();
         config.setSubscriptionId("test-sub");
         config.setStallDetectionMode(StallDetectionMode.DETECT_AND_RESTART);
         config.setStallThreshold(Duration.ofSeconds(10));
         config.setMonitorInterval(Duration.ofSeconds(30));
+        config.setMaxRestartAttempts(5);
 
         now = Instant.parse("2023-01-01T10:00:00Z");
-        clock = Clock.fixed(now, ZoneId.of("UTC"));
+        Clock clock = Clock.fixed(now, ZoneId.of("UTC"));
 
-        // Factory to inject mocks and capture callbacks
-        SubscriberManager.ComponentsFactory factory = new SubscriberManager.ComponentsFactory() {
-            @Override
-            public MessageReceiverHandler createHandler(MessageProcessor p, SubscriberMetrics m, Clock c, Runnable onSuccess) {
-                capturedSuccessCallback = onSuccess;
-                return mockHandler;
-            }
+        when(factory.getScheduler()).thenReturn(scheduler);
+        when(factory.getClock()).thenReturn(clock);
+        when(factory.createMetrics(anyString())).thenReturn(metrics);
+        when(factory.createBackoff(any(SubscriptionConfig.class))).thenReturn(backoff);
+        when(factory.createHandler(any(MessageProcessor.class), any(SubscriberMetrics.class), any(Runnable.class))).thenReturn(mockHandler);
+        when(factory.createSubscriber(anyString(), any(), any(Runnable.class))).thenReturn(mockSubscriber);
 
-            @Override
-            public ManagedSubscriber createSubscriber(String subId, PubSubSubscriberTemplate t, Consumer<BasicAcknowledgeablePubsubMessage> h, Runnable onFailure) {
-                capturedFailureCallback = onFailure;
-                return mockSubscriber;
-            }
-        };
+        manager = new SubscriberManager("test-manager", config, processor, factory);
+    }
 
-        manager = new SubscriberManager("test-manager", config, processor, template, scheduler, clock, backoff, metricsFactory, factory);
+    private Runnable captureFailureCallback() {
+        ArgumentCaptor<Runnable> captor = ArgumentCaptor.forClass(Runnable.class);
+        verify(factory, atLeastOnce()).createSubscriber(anyString(), any(), captor.capture());
+        return captor.getValue();
+    }
+
+    private Runnable captureSuccessCallback() {
+        ArgumentCaptor<Runnable> captor = ArgumentCaptor.forClass(Runnable.class);
+        verify(factory, atLeastOnce()).createHandler(any(MessageProcessor.class), any(SubscriberMetrics.class), captor.capture());
+        return captor.getValue();
     }
 
     @Test
     void start_startsSubscriberAndSchedulesMonitor() {
-        when(scheduler.scheduleWithFixedDelay(any(), any(Duration.class))).thenReturn(mock(ScheduledFuture.class));
+        ScheduledFuture<?> future = mock(ScheduledFuture.class);
+
+        doReturn(future)
+            .when(scheduler)
+            .scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
 
         manager.start();
 
@@ -97,9 +98,21 @@ class SubscriberManagerTest {
     }
 
     @Test
+    void start_isIdempotent() {
+        manager.start();
+        manager.start();
+
+        verify(mockSubscriber, times(1)).start();
+        verify(scheduler, times(1)).scheduleWithFixedDelay(any(), any());
+    }
+
+    @Test
     void stop_stopsSubscriberAndCancelsMonitor() {
         ScheduledFuture<?> future = mock(ScheduledFuture.class);
-        when(scheduler.scheduleWithFixedDelay(any(), any(Duration.class))).thenReturn((ScheduledFuture) future);
+
+        doReturn(future)
+            .when(scheduler)
+            .scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
 
         manager.start();
         manager.stop();
@@ -110,94 +123,6 @@ class SubscriberManagerTest {
     }
 
     @Test
-    void monitor_detectsStall_andSchedulesRestart() {
-        // Arrange
-        manager.start();
-        when(mockSubscriber.isRunning()).thenReturn(true);
-
-        // Last message was 20 seconds ago (threshold is 10s)
-        when(mockHandler.getLastMessageTime()).thenReturn(now.minusSeconds(20));
-
-        // Capture the monitor task
-        ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
-        verify(scheduler).scheduleWithFixedDelay(taskCaptor.capture(), any());
-
-        // Act: Run monitor
-        taskCaptor.getValue().run();
-
-        // Assert
-        verify(metrics).incrementStall();
-        // Should schedule a restart task
-        verify(scheduler).schedule(any(Runnable.class), any(Instant.class));
-    }
-
-    @Test
-    void monitor_noStall_ifWithinThreshold() {
-        manager.start();
-        when(mockSubscriber.isRunning()).thenReturn(true);
-        when(mockHandler.getLastMessageTime()).thenReturn(now.minusSeconds(5)); // 5s < 10s
-
-        ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
-        verify(scheduler).scheduleWithFixedDelay(taskCaptor.capture(), any());
-
-        taskCaptor.getValue().run();
-
-        verify(metrics, never()).incrementStall();
-        verify(scheduler, never()).schedule(any(Runnable.class), any(Instant.class));
-    }
-
-    @Test
-    void failureCallback_schedulesRestart() {
-        manager.start();
-
-        // Simulate subscriber failure
-        capturedFailureCallback.run();
-
-        verify(metrics).incrementRestart();
-        verify(backoff).nextDelay(1);
-        verify(scheduler).schedule(any(Runnable.class), any(Instant.class));
-    }
-
-    @Test
-    void restartTask_restartsSubscriber() {
-        manager.start();
-
-        // Capture the restart task scheduled by a failure
-        capturedFailureCallback.run();
-        ArgumentCaptor<Runnable> restartTaskCaptor = ArgumentCaptor.forClass(Runnable.class);
-        verify(scheduler).schedule(restartTaskCaptor.capture(), any(Instant.class));
-
-        // Execute restart
-        restartTaskCaptor.getValue().run();
-
-        // Should stop and start
-        verify(mockSubscriber).stop();
-        verify(mockSubscriber, times(2)).start(); // Once initial, once restart
-    }
-
-    @Test
-    void health_reportsRecovering_whenBackingOff() {
-        manager.start();
-
-        // Simulate failure and backoff
-        when(mockSubscriber.isRunning()).thenReturn(false);
-        capturedFailureCallback.run(); // attempt 1
-
-        // Health should be UP (Recovering) because attempts (1) <= max (default 5)
-        assertThat(manager.health().getStatus()).isEqualTo(Status.UP);
-        assertThat(manager.health().getDetails()).containsEntry("state", "recovering");
-    }
-
-    @Test
-    void health_reportsUp_whenRunning() {
-        manager.start();
-        when(mockSubscriber.isRunning()).thenReturn(true);
-
-        assertThat(manager.health().getStatus()).isEqualTo(Status.UP);
-        assertThat(manager.health().getDetails()).containsEntry("state", "running");
-    }
-
-    @Test
     void pause_stopsSubscriber_andUpdatesHealth() {
         manager.start();
         manager.pause();
@@ -205,6 +130,24 @@ class SubscriberManagerTest {
         verify(mockSubscriber).stop();
         assertThat(manager.health().getStatus()).isEqualTo(Status.OUT_OF_SERVICE);
         assertThat(manager.getState()).isEqualTo("PAUSED");
+    }
+
+    @Test
+    void pause_onInactiveManager_doesNotStopSubscriberAgain() {
+        manager.stop(); // Already calls managedSubscriber.stop()
+        clearInvocations(mockSubscriber);
+
+        manager.pause();
+
+        verify(mockSubscriber, never()).stop();
+        assertThat(manager.getState()).isEqualTo("PAUSED");
+    }
+
+    @Test
+    void resume_onInactiveManager_doesNotStartSubscriber() {
+        manager.resume();
+        verify(mockSubscriber, never()).start();
+        assertThat(manager.getState()).isEqualTo("STOPPED");
     }
 
     @Test
@@ -220,18 +163,151 @@ class SubscriberManagerTest {
     }
 
     @Test
+    void restartTask_restartsSubscriber() {
+        manager.start();
+
+        ScheduledFuture<?> future = mock(ScheduledFuture.class);
+
+        doReturn(future)
+            .when(scheduler)
+            .scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
+
+        // Capture the restart task scheduled by a failure
+        captureFailureCallback().run();
+        ArgumentCaptor<Runnable> restartTaskCaptor = ArgumentCaptor.forClass(Runnable.class);
+        verify(scheduler, atLeastOnce()).schedule(restartTaskCaptor.capture(), any(Instant.class));
+
+        // Execute restart
+        restartTaskCaptor.getValue().run();
+
+        // Should stop and start
+        verify(mockSubscriber).stop();
+        verify(mockSubscriber, times(2)).start(); // Once initial, once restart
+    }
+
+    @Test
+    void restart_doesNotRun_ifStopped() {
+        manager.start();
+
+        ScheduledFuture<?> future = mock(ScheduledFuture.class);
+
+        doReturn(future)
+            .when(scheduler)
+            .scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
+
+        // Capture restart task
+        captureFailureCallback().run();
+        ArgumentCaptor<Runnable> restartTaskCaptor = ArgumentCaptor.forClass(Runnable.class);
+        verify(scheduler, atLeastOnce()).schedule(restartTaskCaptor.capture(), any(Instant.class));
+
+        // Stop manager before task runs
+        manager.stop();
+        clearInvocations(mockSubscriber);
+
+        // Run restart task
+        restartTaskCaptor.getValue().run();
+
+        verify(mockSubscriber, never()).start();
+    }
+
+    @Test
+    void restartTask_respectsPausedState() {
+        manager.start();
+
+        // 1. Capture restart task scheduled by a failure
+        captureFailureCallback().run();
+        ArgumentCaptor<Runnable> restartTaskCaptor = ArgumentCaptor.forClass(Runnable.class);
+        verify(scheduler, atLeastOnce()).schedule(restartTaskCaptor.capture(), any(Instant.class));
+
+        // 2. Pause the manager before the task executes
+        manager.pause();
+        clearInvocations(mockSubscriber);
+
+        // 3. Execute the pending restart task
+        restartTaskCaptor.getValue().run();
+
+        // 4. Subscriber should NOT be started because manager is paused
+        verify(mockSubscriber, never()).start();
+    }
+
+    @Test
+    void monitor_detectsStall_andSchedulesRestart() {
+        // Arrange
+        manager.start();
+        when(mockSubscriber.isRunning()).thenReturn(true);
+        // Force stall detection via the handler's new encapsulated logic
+        when(mockHandler.isStalled(config.getStallThreshold())).thenReturn(true);
+        when(mockHandler.getLastMessageTime()).thenReturn(now.minus(config.getStallThreshold().plus(Duration.ofSeconds(1))));
+
+        // Capture the monitor task
+        ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
+        verify(scheduler, atLeastOnce()).scheduleWithFixedDelay(taskCaptor.capture(), any(Duration.class));
+
+        ScheduledFuture<?> future = mock(ScheduledFuture.class);
+
+        doReturn(future)
+            .when(scheduler)
+            .scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
+
+        // Act: Run monitor
+        taskCaptor.getValue().run();
+
+        // Assert
+        verify(mockHandler).recordIdleMetrics();
+        verify(metrics).incrementStall();
+        // Should schedule a restart task
+        verify(scheduler).schedule(any(Runnable.class), any(Instant.class));
+    }
+
+    @Test
+    void monitor_noStall_ifWithinThreshold() {
+        manager.start();
+        when(mockSubscriber.isRunning()).thenReturn(true);
+        // Mock handler reporting no stall
+        when(mockHandler.isStalled(config.getStallThreshold())).thenReturn(false);
+        when(mockHandler.getLastMessageTime()).thenReturn(now.minus(config.getStallThreshold().minus(Duration.ofSeconds(1))));
+
+        // Capture the monitor task
+
+        ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
+        verify(scheduler, atLeastOnce()).scheduleWithFixedDelay(taskCaptor.capture(), any(Duration.class));
+
+        taskCaptor.getValue().run();
+
+        // Should NOT schedule a restart task
+        verify(metrics, never()).incrementStall();
+        verify(scheduler, never()).schedule(any(Runnable.class), any(Instant.class));
+    }
+
+    @Test
+    void monitor_recordsIdleMetrics_evenWhenHealthy() {
+        manager.start();
+        when(mockSubscriber.isRunning()).thenReturn(true);
+        when(mockHandler.isStalled(any())).thenReturn(false);
+
+        ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
+        verify(scheduler, atLeastOnce()).scheduleWithFixedDelay(taskCaptor.capture(), any(Duration.class));
+
+        // Run monitor
+        taskCaptor.getValue().run();
+
+        verify(mockHandler).recordIdleMetrics();
+    }
+
+    @Test
     void monitor_skipsIfPaused() {
         manager.start();
         manager.pause();
 
-        // Force stall condition
-        when(mockHandler.getLastMessageTime()).thenReturn(now.minusSeconds(20));
+        // Ensure monitor is a no-op when paused
+        when(mockHandler.isStalled(any(Duration.class))).thenReturn(true);
 
         // Run monitor
         ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
-        verify(scheduler).scheduleWithFixedDelay(taskCaptor.capture(), any());
+        verify(scheduler, atLeastOnce()).scheduleWithFixedDelay(taskCaptor.capture(), any(Duration.class));
         taskCaptor.getValue().run();
 
+        verify(mockHandler, never()).recordIdleMetrics();
         verify(metrics, never()).incrementStall();
     }
 
@@ -240,14 +316,16 @@ class SubscriberManagerTest {
         config.setStallDetectionMode(StallDetectionMode.NO_DETECTION);
         manager.start();
 
-        // Force stall condition
-        when(mockHandler.getLastMessageTime()).thenReturn(now.minusSeconds(20));
+        // Even if stalled internally
+        when(mockHandler.isStalled(any(Duration.class))).thenReturn(true);
+        when(mockHandler.getLastMessageTime()).thenReturn(now.minus(config.getStallThreshold().plus(Duration.ofSeconds(1))));
 
         // Run monitor
         ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
-        verify(scheduler).scheduleWithFixedDelay(taskCaptor.capture(), any());
+        verify(scheduler, atLeastOnce()).scheduleWithFixedDelay(taskCaptor.capture(), any(Duration.class));
         taskCaptor.getValue().run();
 
+        verify(mockHandler, never()).recordIdleMetrics();
         verify(metrics, never()).incrementStall();
         verify(scheduler, never()).schedule(any(Runnable.class), any(Instant.class));
     }
@@ -257,17 +335,37 @@ class SubscriberManagerTest {
         config.setStallDetectionMode(StallDetectionMode.DETECT_AND_WARN);
         manager.start();
 
-        // Force stall condition
-        when(mockHandler.getLastMessageTime()).thenReturn(now.minusSeconds(20));
+        // Force stall detection
+        when(mockHandler.isStalled(config.getStallThreshold())).thenReturn(true);
+        when(mockHandler.getLastMessageTime()).thenReturn(now.minus(config.getStallThreshold().plus(Duration.ofSeconds(1))));
 
         // Run monitor
         ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
-        verify(scheduler).scheduleWithFixedDelay(taskCaptor.capture(), any());
+        verify(scheduler, atLeastOnce()).scheduleWithFixedDelay(taskCaptor.capture(), any(Duration.class));
         taskCaptor.getValue().run();
 
+        verify(mockHandler).recordIdleMetrics();
         verify(metrics).incrementStall();
         // Should NOT schedule restart
         verify(scheduler, never()).schedule(any(Runnable.class), any(Instant.class));
+    }
+
+    @Test
+    void failureCallback_schedulesRestart() {
+        manager.start();
+
+        ScheduledFuture<?> future = mock(ScheduledFuture.class);
+
+        doReturn(future)
+            .when(scheduler)
+            .scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
+
+        // Simulate subscriber failure
+        captureFailureCallback().run();
+
+        verify(metrics).incrementRestart();
+        verify(backoff).nextDelay(1);
+        verify(scheduler).schedule(any(Runnable.class), any(Instant.class));
     }
 
     @Test
@@ -275,17 +373,26 @@ class SubscriberManagerTest {
         manager.start();
 
         // 1. Fail once
-        capturedFailureCallback.run();
+        captureFailureCallback().run();
         verify(backoff).nextDelay(1);
 
         // 2. Success
-        capturedSuccessCallback.run();
+        captureSuccessCallback().run();
         verify(backoff).reset();
 
-        // 3. Fail again - should be attempt 1 again if reset worked
+        // 3. Fail again - should be attempt 1 again if reset worked.
         clearInvocations(backoff);
-        capturedFailureCallback.run();
+        captureFailureCallback().run();
         verify(backoff).nextDelay(1);
+    }
+
+    @Test
+    void health_reportsUp_whenRunning() {
+        manager.start();
+        when(mockSubscriber.isRunning()).thenReturn(true);
+
+        assertThat(manager.health().getStatus()).isEqualTo(Status.UP);
+        assertThat(manager.health().getDetails()).containsEntry("state", "running");
     }
 
     @Test
@@ -296,21 +403,81 @@ class SubscriberManagerTest {
     }
 
     @Test
-    void restart_doesNotRun_ifStopped() {
+    void health_reportsRecovering_whenBackingOff() {
         manager.start();
 
-        // Capture restart task
-        capturedFailureCallback.run();
-        ArgumentCaptor<Runnable> restartTaskCaptor = ArgumentCaptor.forClass(Runnable.class);
-        verify(scheduler).schedule(restartTaskCaptor.capture(), any(Instant.class));
+        // Simulate failure and backoff
+        when(mockSubscriber.isRunning()).thenReturn(false);
+        captureFailureCallback().run(); // attempt 1
 
-        // Stop manager before task runs
+        // Health should be UP (Recovering) because attempts (1) <= max (default 5)
+        assertThat(manager.health().getStatus()).isEqualTo(Status.UP);
+        assertThat(manager.health().getDetails()).containsEntry("state", "recovering");
+    }
+
+    @Test
+    void health_reportsDown_whenRestartAttemptsExhausted() {
+        manager.start();
+        config.setMaxRestartAttempts(1);
+
+        // Simulate multiple failures to exceed max attempts
+        captureFailureCallback().run(); // attempt 1
+        captureFailureCallback().run(); // attempt 2
+
+        when(mockSubscriber.isRunning()).thenReturn(false);
+
+        assertThat(manager.health().getStatus()).isEqualTo(Status.DOWN);
+        assertThat(manager.health().getDetails()).containsEntry("state", "failed");
+    }
+
+    @Test
+    void isHealthy_returnsTrue_whenRunning() {
+        manager.start();
+        when(mockSubscriber.isRunning()).thenReturn(true);
+        assertThat(manager.isHealthy()).isTrue();
+    }
+
+    @Test
+    void isHealthy_returnsTrue_whenRecovering() {
+        manager.start();
+        when(mockSubscriber.isRunning()).thenReturn(false);
+        captureFailureCallback().run(); // attempt 1 <= default 5
+        assertThat(manager.isHealthy()).isTrue();
+    }
+
+    @Test
+    void isHealthy_returnsFalse_whenStopped() {
         manager.stop();
-        clearInvocations(mockSubscriber);
+        assertThat(manager.isHealthy()).isFalse();
+    }
 
-        // Run restart task
-        restartTaskCaptor.getValue().run();
+    @Test
+    void isHealthy_returnsFalse_whenPaused() {
+        manager.start();
+        manager.pause();
+        assertThat(manager.isHealthy()).isFalse();
+    }
 
-        verify(mockSubscriber, never()).start();
+    @Test
+    void isHealthy_returnsFalse_whenFailed() {
+        manager.start();
+        config.setMaxRestartAttempts(0);
+        when(mockSubscriber.isRunning()).thenReturn(false);
+        captureFailureCallback().run(); // attempt 1 > max 0
+        assertThat(manager.isHealthy()).isFalse();
+    }
+
+    @Test
+    void getState_returnsStateFromSubscriber_whenActive() {
+        manager.start();
+
+        when(mockSubscriber.getState()).thenReturn("STARTING");
+        assertThat(manager.getState()).isEqualTo("STARTING");
+
+        when(mockSubscriber.getState()).thenReturn("RUNNING");
+        assertThat(manager.getState()).isEqualTo("RUNNING");
+
+        when(mockSubscriber.getState()).thenReturn("FAILED");
+        assertThat(manager.getState()).isEqualTo("FAILED");
     }
 }

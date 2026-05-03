@@ -1,6 +1,7 @@
 package com.example.gcp.pubsub.demo;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -40,6 +41,14 @@ public class MessageReceiverHandler implements Consumer<BasicAcknowledgeablePubs
         } catch (Exception e) {
             message.nack();
         }
+    }
+
+    public void recordIdleMetrics() {
+        metrics.recordIdle(Duration.between(lastMessageTime.get(), Instant.now(clock)));
+    }
+
+    public boolean isStalled(Duration threshold) {
+        return Duration.between(lastMessageTime.get(), Instant.now(clock)).compareTo(threshold) > 0;
     }
 
     public Instant getLastMessageTime() {
